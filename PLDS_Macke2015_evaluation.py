@@ -15,8 +15,8 @@ Created on Fri Aug 31 11:55:33 2018
 import numpy as np
 import matplotlib.pyplot as plt
 #import time
-from linear_regression import myL2norm, RFlin
-from Macke_PLDS import PLDS
+#from linear_regression import myL2norm, RFlin
+from Macke_PLDS2015 import PLDS
 from sklearn.decomposition import FactorAnalysis
 import pickle
 

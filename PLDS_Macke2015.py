@@ -37,7 +37,7 @@ class PLDS:
         # C = mapping function
         # A = temporal transfer function
         # Q0 = prior noise covariance of latent
-        # Q = noise covariance of altent
+        # Q = noise covariance of latent
         # x0 = prior mean of latent
         # seed = fixes randomness (possibly not everywhere - need to check)
         # B = stimulus coefficients
