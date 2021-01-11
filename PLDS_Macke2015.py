@@ -782,6 +782,43 @@ class EM:
                                     poisson=poisson, disp=False)
             return MOD0
 
+    def reconstruction(self, data_test, S_test, MOD0, poisson=True):
+        # leave one neuron out, infer the latent from the remaining population
+        # then predict the left out neuron's activity
+        pred = np.zeros(data_test.shape) * np.nan
+        # loop over neurons
+        for nn in range(MOD0.ydim):
+            start = time.time()
+            print('prediction for neuron '+np.str(nn))
+            mask = np.ones(MOD0.ydim, dtype='bool')
+            mask[nn] = False
+            data_nn = data_test[:, mask, :]
+            if poisson:
+                Rtmp = None
+            else:
+                Rtmp = MOD0.R[mask, :]
+                Rtmp = Rtmp[:, mask]
+            # create model that leaves one neuron out
+            MOD_nn = PLDS(MOD0.xdim, MOD0.ydim - 1, n_step=MOD0.n_step,
+                          C=MOD0.C[mask, :], Q0=MOD0.Q0, A=MOD0.A, Q=MOD0.Q, x0=MOD0.x0,
+                          B=MOD0.B[mask, :], R=Rtmp,
+                          Ttrials=data_nn.shape[2])
+            # infer latent given remaining population
+            MOD_nn.x = np.random.randn(np.max(MOD_nn.n_step), MOD_nn.xdim, MOD_nn.Ttrials)
+            mu, sigma = MOD_nn.E_step(MOD_nn.x, data_nn, MOD_nn.B, MOD_nn.C, MOD_nn.A, MOD_nn.Q,
+                                      MOD_nn.Q0, MOD_nn.x0, MOD_nn.R, X=S_test,
+                                      poisson=poisson, disp=False)
+            # predict the left out neuron's activity
+            for tt in range(MOD_nn.Ttrials):
+                pred[:, nn, tt] = np.exp(MOD0.C.dot(mu[:, :, tt].T) + MOD0.B.dot(S_test[:, :, tt].T))[nn, :]
+            end = time.time()
+            print('------- ', np.round(end-start,3), 'sec -------')
+        # compute the mean squared error for every neuron
+        mse = np.mean((data_test - pred) ** 2, axis=(0, 2))
+        return pred, mse
+
+
+
 class bcolors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'

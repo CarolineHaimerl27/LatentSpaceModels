@@ -60,6 +60,7 @@ class spiking:
                 z = np.linspace(0,2 * np.pi,self.N + 1)
                 angles = [np.cos(r) for r in z]
                 del angles[-1]
+                # decoder
                 D = np.asarray(angles).T
 
                 # scaling
@@ -75,6 +76,7 @@ class spiking:
                 z = np.linspace(0,2 * np.pi,self.N + 1)
                 angles = [(np.cos(r),np.sin(r)) for r in z]
                 del angles[-1]
+                # decoder
                 D = np.asarray(angles).T
 
                 # scaling
@@ -177,10 +179,15 @@ class spiking:
             
         else:
             for t in range(self.n_step - 1):        
+                # update voltage trace for time t
                 V[:, t + 1] = (1 - self.dt * self.lbd_v) * V[:, t] \
                                 + self.dt * np.dot(D.T, c[:, t]) \
                                 + np.dot(Omega, O[:, t])
+                
+                # which neurons are above threshold T (given some noise with sd thresh_nois_sig)
                 test = V[:,t + 1] - np.ravel(T) +np.random.randn(V.shape[0])*thresh_nois_sig
+                
+                # which one neuron is allowed to spike
                 if np.max(test) >= 0:
                     spiking_neuron = np.random.choice(np.where(test==test.max())[0])
                     O[spiking_neuron, t + 1] = 1
