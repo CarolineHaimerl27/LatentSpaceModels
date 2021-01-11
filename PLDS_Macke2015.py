@@ -809,8 +809,12 @@ class EM:
                                       MOD_nn.Q0, MOD_nn.x0, MOD_nn.R, X=S_test,
                                       poisson=poisson, disp=False)
             # predict the left out neuron's activity
-            for tt in range(MOD_nn.Ttrials):
-                pred[:, nn, tt] = np.exp(MOD0.C.dot(mu[:, :, tt].T) + MOD0.B.dot(S_test[:, :, tt].T))[nn, :]
+            if poisson:
+                for tt in range(MOD_nn.Ttrials):
+                    pred[:, nn, tt] = np.exp(MOD0.C.dot(mu[:, :, tt].T) + MOD0.B.dot(S_test[:, :, tt].T))[nn, :]
+            else:
+                for tt in range(MOD_nn.Ttrials):
+                    pred[:, nn, tt] = (MOD0.C.dot(mu[:, :, tt].T) + MOD0.B.dot(S_test[:, :, tt].T))[nn, :]
             end = time.time()
             print('------- ', np.round(end-start,3), 'sec -------')
         # compute the mean squared error for every neuron
