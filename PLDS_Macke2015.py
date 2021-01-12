@@ -449,6 +449,7 @@ class PLDS:
                             X=X, poisson=poisson, disp=disp, xtol=xtol)
         # get the negative Hessian of the posterior
         # then get its inverse
+        ttrial=0
         sigma = [self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
                                             X=X[:,:,ttrial], poisson=poisson)),
                                         np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1)
@@ -718,14 +719,15 @@ class EM:
         return MOD_back
 
     def fit(self, data, xdim, poisson, seed, maxiterem = 10, ltol=1e-1,
-            C=None, Q0=None, A=None, Q=None, x0=None, B=None, R=None, S=None):
+            C=None, Q0=None, A=None, Q=None, x0=None, B=None, R=None, S=None,
+            cscal=2, sigQ = 0.1 , a=.1, sigR=.1):
         # expect data to be T by ydim by Trials
         if S is None:
             S = np.ones([data.shape[0], 1, data.shape[2]])
         # starting parameters:
         self.starters(xdim, data.shape[1], S.shape[1], seed,
                  C=C, Q0=Q0, A=A, Q=Q, x0=x0, B=B, R=R,
-                 cscal=2, sigQ = 0.1 , a=.1, sigR=.1)
+                 cscal=cscal, sigQ = sigQ , a=a, sigR=sigR)
         MOD0 = PLDS(xdim, data.shape[1], n_step=[data.shape[0]],
                     C=self.C, Q0=self.Q0, A=self.A, Q=self.Q, x0=self.x0,
                     B=self.B, R=self.R,Ttrials=data.shape[2])
@@ -785,6 +787,8 @@ class EM:
     def reconstruction(self, data_test, S_test, MOD0, poisson=True):
         # leave one neuron out, infer the latent from the remaining population
         # then predict the left out neuron's activity
+        if S_test is None:
+            S_test = np.ones([data_test.shape[0], 1, data_test.shape[2]])
         pred = np.zeros(data_test.shape) * np.nan
         # loop over neurons
         for nn in range(MOD0.ydim):
