@@ -826,6 +826,18 @@ class EM:
         return pred, mse
 
 
+def print_par(MOD, obs=False):
+    print('---- latent var parameters ------')
+    print('A: ', np.linalg.eigvals(MOD.A))
+    print('Q: ', np.linalg.eigvals(MOD.Q))
+    print('---- prior parameters -----------')
+    print('x0: ', MOD.x0)
+    print('Q0: ', np.linalg.eigvals(MOD.Q0))
+    if obs:
+        print('---- observed var parameters ----')
+        print('C: ', MOD.C)
+        print('B: ', MOD.B)
+    print(' ')
 
 class bcolors:
     HEADER = '\033[95m'
