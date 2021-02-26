@@ -100,22 +100,23 @@ class PLDS:
         axy = plt.subplot2grid((1, 2), (0,1), rowspan = 1, colspan=1)
         if self.xdim==1:
             axxz.plot(self.x[:,0, :], 'k')
-            axxz.plot(self.x[:, 0, ttrial], 'r')
+            axxz.plot(self.x[:, 0, ttrial], 'r', label='example trial')
         elif self.xdim == 2:
             axxz.plot(self.x[:, 0, :], self.x[:, 1, :], 'k')
-            axxz.plot(self.x[:, 0, ttrial], self.x[:, 1, ttrial], 'r')
+            axxz.plot(self.x[:, 0, ttrial], self.x[:, 1, ttrial], 'r', label='example trial')
         elif self.xdim>2:
             axxz.plot(self.x[:, cho_xdim, :], 'k')
-            axxz.plot(self.x[:, cho_xdim, ttrial], 'r')
+            axxz.plot(self.x[:, cho_xdim, ttrial], 'r', label='example trial')
         axxz.set_title('latent trajectories')
         if np.max(self.y)==1:
             spksT = np.arange(self.y[:, :, ttrial].shape[0])
             spks = [spksT[self.y[:, ii, ttrial] > 0] for ii in range(self.y.shape[1])]
             axy.eventplot(spks)
         else:
-            axy.plot(self.y[:,:,ttrial]);
+            axy.plot(self.y[:,:,ttrial], '-k');
+        axxz.legend()
         axxz.set_xlabel('time')
-        axy.set_title('observed spike count of trial %.0f' %ttrial)
+        axy.set_title('observed spike count for neurons in trial %.0f' %(ttrial+1))
         axy.set_xlabel('time')
         return axxz, axy
 
@@ -404,14 +405,14 @@ class PLDS:
                                     X=X, poisson=poisson)
 
     def inference(self, Xtmp0, Ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
-               X=None, poisson=True, disp=True, xtol=1e-05):
+               X=None, poisson=True, disp=True): #, xtol=1e-05):
         if X is None:
             X = np.ones([Xtmp0.shape[0], 1, Xtmp0.shape[2]])
         xres = np.zeros(Xtmp0.shape)*np.nan
         for ttrial in range(Xtmp0.shape[2]):
-            res = minimize(fun=self.wrap_x_posterior, x0=Xtmp0[:, :, ttrial].ravel(), method='Newton-CG',
-                           jac=self.wrap_x_Jposterior, hess=self.wrap_x_Hposterior,
-                           options={'disp': disp, 'xtol': xtol},
+            res = minimize(fun=self.wrap_x_posterior, x0=Xtmp0[:, :, ttrial].ravel(), method='BFGS', #method='Newton-CG',
+                           jac=self.wrap_x_Jposterior, #hess=self.wrap_x_Hposterior,
+                           options={'disp': disp}, # , 'xtol': xtol
                            args=(Ytmp[:, :, ttrial],
                                  Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp, X[:,:,ttrial],
                                  poisson))
@@ -439,21 +440,41 @@ class PLDS:
 
     # create mu(k) and sigma(k)
     def E_step(self, Xtmp0, Ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
-               X=None, poisson=True, disp=True, xtol=1e-05):
+               X=None, poisson=True, disp=True): #, xtol=1e-05):
         # computes the mean and the covariance of the true or approximated gaussian log posterior
         # covariance is the negative Hessian of the log posterior ("H_log_posterior" already computes the negative!!! because it is for the negative log posterior)
         # OUTPUT mu is an array T by xdim by #trials and sigma is a list of length #trials and entries iin block-list form with T blocks xdim by xdim
         if X is None:
             X = np.ones([Xtmp0.shape[0], 1, Xtmp0.shape[2]])
         mu = self.inference(Xtmp0, Ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
-                            X=X, poisson=poisson, disp=disp, xtol=xtol)
+                            X=X, poisson=poisson, disp=disp) #, xtol=xtol)
         # get the negative Hessian of the posterior
         # then get its inverse
-        ttrial=0
-        sigma = [self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+        '''bla = [self.scipy_block(
+            self.H_log_posterior(mu[:, :, ttrial], Ytmp[:, :, ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+                                 X=X[:, :, ttrial], poisson=poisson))
+                 for ttrial in range(Ytmp.shape[2])]'''
+        sigma = []
+        for ttrial in range(Ytmp.shape[2]):
+            try:
+                sigma.append(self.block_matrix_list(np.linalg.inv(
+                    self.H_log_posterior(mu[:, :, ttrial], Ytmp[:, :, ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp,
+                                         Rtmp=Rtmp,
+                                         X=X[:, :, ttrial], poisson=poisson)),
+                                                    mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1))
+
+                #sigma.append(self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+                #                            X=X[:,:,ttrial], poisson=poisson)),
+                #                       np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1))
+            except:
+                print("\n !!!problem with inverting the hessian log posterior on trial %i!!!\n" %ttrial)
+                print(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+                                            X=X[:,:,ttrial], poisson=poisson))
+                break
+        '''sigma = [self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
                                             X=X[:,:,ttrial], poisson=poisson)),
                                         np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1)
-                for ttrial in range(Ytmp.shape[2])]
+                for ttrial in range(Ytmp.shape[2])]'''
         return mu, sigma
 
     # helper function for scipy's inversion of blockwise matrices
@@ -676,7 +697,7 @@ class EM:
 
     def starters(self, xdim, ydim, sdim, seed,
                  C=None, Q0=None, A=None, Q=None, x0=None, B=None, R=None,
-                 cscal=2, sigQ = 0.1 , a=.1, sigR=.1):
+                 cscal=2, sigQ = 0.001 , a=.1, sigR=.1):
         # here intelligent ways of choosing starting parameters
         # can be implemented
         np.random.seed(seed)
@@ -720,7 +741,7 @@ class EM:
 
     def fit(self, data, xdim, poisson, seed, maxiterem = 10, ltol=1e-1,
             C=None, Q0=None, A=None, Q=None, x0=None, B=None, R=None, S=None,
-            cscal=2, sigQ = 0.1 , a=.1, sigR=.1):
+            cscal=2, sigQ = 0.001 , a=.1, sigR=.1):
         # expect data to be T by ydim by Trials
         if S is None:
             S = np.ones([data.shape[0], 1, data.shape[2]])
@@ -734,10 +755,9 @@ class EM:
         MOD0.x = np.random.randn(np.max(MOD0.n_step), MOD0.xdim, MOD0.Ttrials)
         start = time.time()
         for ii in range(maxiterem):
-            print('--- iter '+np.str(ii)+' ---')
+            print('--- iter '+np.str(ii+1)+' ---')
             start_ii = time.time()
-
-            # E-step
+            ##### E-step #####
             mu, sigma = MOD0.E_step(MOD0.x, data, MOD0.B, MOD0.C, MOD0.A, MOD0.Q,
                                    MOD0.Q0, MOD0.x0, MOD0.R, X=S,
                                    poisson=poisson, disp=False)
@@ -750,6 +770,7 @@ class EM:
                 print('   lower bound at start ', sum(L0[-1]))
             # make a backup
             MOD_back = self.backup(MOD0)
+            ##### M-step #####
             # update parameters for latent
             MOD0.x0 = MOD0.upx0(mu)
             MOD0.Q0 = MOD0.upQ0(MOD0.x0, mu, [sigma[kk][0][0] for kk in range(MOD0.Ttrials)])
@@ -764,6 +785,7 @@ class EM:
             L0.append([MOD0.L_obs(MOD0.C, MOD0.B, data, mu, sigma, X=S, Rtmp=MOD0.R, poisson=poisson),
                       MOD0.L_dyn(MOD0.x, mu, sigma, MOD0.x0, MOD0.Q0)])
             print('   lower bound after iteration ', ii, ': ', sum(L0[-1]))
+            print('     decrease achieved (old neglik - new neglik): ', (sum(L0[ii])-sum(L0[ii+1])))
             if (sum(L0[ii])-sum(L0[ii+1]))<=ltol:
                 print('----------\n stopped early at iteration', ii, ': ')
                 print('difference in last two lower bounds: ', sum(L0[ii])-sum(L0[ii+1]))
@@ -774,24 +796,38 @@ class EM:
                 del MOD_back
             end_ii = time.time()
             print('time needed: ', end_ii-start_ii)
+            # make sure A does not increase above 1 (otherwise divergence)
+            if (MOD0.xdim==1):
+                if (MOD0.A>1):
+                    print('(correcting A to be <1)')
+                    MOD0.A=.99
+            elif any(np.linalg.eigvals(MOD0.A) > 1):
+                print('(correcting A to be <1)')
+                u, s, v = np.linalg.svd(MOD0.A)
+                s[s >= 1] = .99
+                MOD0.A = np.real(u.dot(np.diag(s)).dot(v))
+
         end = time.time()
         print('time total needed ', end-start)
         if sum(L0[-2])<sum(L0[-1]):
+            print('last iteration did not improve fit, instead returning previous iteration parameters')
             return MOD_back
         else:
             MOD0.x, sigma = MOD0.E_step(MOD0.x, data, MOD0.B, MOD0.C, MOD0.A, MOD0.Q,
                                     MOD0.Q0, MOD0.x0, MOD0.R, X=S,
                                     poisson=poisson, disp=False)
-            return MOD0
+            return MOD0, sigma
 
-    def reconstruction(self, data_test, S_test, MOD0, poisson=True):
+    def reconstruction(self, data_test, S_test, MOD0, poisson=True, neurons=None):
         # leave one neuron out, infer the latent from the remaining population
         # then predict the left out neuron's activity
         if S_test is None:
             S_test = np.ones([data_test.shape[0], 1, data_test.shape[2]])
         pred = np.zeros(data_test.shape) * np.nan
         # loop over neurons
-        for nn in range(MOD0.ydim):
+        if neurons is None:
+            neurons = np.arange(MOD0.ydim)
+        for nn in neurons:
             start = time.time()
             print('prediction for neuron '+np.str(nn))
             mask = np.ones(MOD0.ydim, dtype='bool')
@@ -800,7 +836,7 @@ class EM:
             if poisson:
                 Rtmp = None
             else:
-                Rtmp = MOD0.R[mask, :]
+                Rtmp = MOD0.R[mask, :].copy()
                 Rtmp = Rtmp[:, mask]
             # create model that leaves one neuron out
             MOD_nn = PLDS(MOD0.xdim, MOD0.ydim - 1, n_step=MOD0.n_step,
@@ -808,7 +844,7 @@ class EM:
                           B=MOD0.B[mask, :], R=Rtmp,
                           Ttrials=data_nn.shape[2])
             # infer latent given remaining population
-            MOD_nn.x = np.random.randn(np.max(MOD_nn.n_step), MOD_nn.xdim, MOD_nn.Ttrials)
+            MOD_nn.x = np.random.randn(np.max(MOD_nn.n_step), MOD_nn.xdim, MOD_nn.Ttrials)*.1
             mu, sigma = MOD_nn.E_step(MOD_nn.x, data_nn, MOD_nn.B, MOD_nn.C, MOD_nn.A, MOD_nn.Q,
                                       MOD_nn.Q0, MOD_nn.x0, MOD_nn.R, X=S_test,
                                       poisson=poisson, disp=False)
@@ -823,7 +859,7 @@ class EM:
             print('------- ', np.round(end-start,3), 'sec -------')
         # compute the mean squared error for every neuron
         mse = np.mean((data_test - pred) ** 2, axis=(0, 2))
-        return pred, mse
+        return pred, mse, mu
 
 
 def print_par(MOD, obs=False):
