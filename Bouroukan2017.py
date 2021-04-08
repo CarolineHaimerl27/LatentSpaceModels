@@ -46,6 +46,13 @@ class spiking:
                 X_dot[0,1:] = np.diff(X[0,:])
                 X[1,:] = optpar[1,:]
                 X_dot[1,1:] = np.diff(X[1,:])
+            elif self.J==3:
+                X[0,:] = optpar[0,:]
+                X_dot[0,1:] = np.diff(X[0,:])
+                X[1,:] = optpar[1,:]
+                X_dot[1,1:] = np.diff(X[1,:])
+                X[2,:] = optpar[2,:]
+                X_dot[2,1:] = np.diff(X[2,:])
             else:
                 X[0,:] = optpar
                 X_dot[0,1:] = np.diff(X[0,:])
@@ -72,9 +79,24 @@ class spiking:
                 # Recurrent Weights
                 Omega = - np.outer(D, D) - self.mu * np.eye(self.N)
                 
-            else:
+            elif self.J==3:
                 z = np.linspace(0,2 * np.pi,self.N + 1)
-                angles = [(np.cos(r),np.sin(r)) for r in z]
+                angles = [(np.cos(r),np.cos(r-.5*np.pi), np.cos(r+.5*np.pi)) for r in z]
+                del angles[-1]
+                # decoder
+                D = np.asarray(angles).T
+
+                # scaling
+                D *= self.decoderscaling / float(self.N)
+
+                # Threshold
+                T = np.reshape(np.sum(D ** 2,0) + self.nu + self.mu, (self.N,1)) * .5
+
+                # Recurrent Weights
+                Omega = - D.T.dot(D) - self.mu * np.eye(self.N)
+            elif self.J==2:
+                z = np.linspace(0,2 * np.pi,self.N + 1)
+                angles = [(np.cos(r), np.sin(r)) for r in z]
                 del angles[-1]
                 # decoder
                 D = np.asarray(angles).T

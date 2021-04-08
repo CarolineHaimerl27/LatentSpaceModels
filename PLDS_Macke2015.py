@@ -10,6 +10,12 @@ import matplotlib.pyplot as plt
 import time
 from scipy.optimize import minimize
 from scipy.linalg import solveh_banded
+from sklearn.decomposition import FactorAnalysis
+
+def unroll(data):
+    tmp = [data[:,:,kk] for kk in range(data.shape[2])]
+    tmp = np.concatenate((tmp))
+    return tmp
 
 class PLDS:
     
@@ -135,7 +141,8 @@ class PLDS:
         if lograte.shape[0] != ytmp.shape[1]:
             return 'error in shapes: lograte.shape[0] != ytmp.shape[1]'
         if poisson:
-            L = np.sum((lograte)*(ytmp.T)-self.bounded_exp(lograte))
+            explograte = self.bounded_exp(lograte)
+            L = np.sum((lograte)*(ytmp.T)-explograte)
         else:
             L = np.sum(np.diag(-.5*(ytmp.T-lograte).T.dot(np.linalg.inv(Rtmp)).dot(ytmp.T-lograte)))
         return -L
@@ -222,7 +229,8 @@ class PLDS:
         if (ytmp.shape[1]!=self.ydim)|(xtmp.shape[1]!=self.xdim):
             return 'error in shapes: xtmp and ytmp need to be of T times xdim or ydim'
         if poisson:
-            dL = (Ctmp.T).dot(ytmp.T)-Ctmp.T.dot(self.bounded_exp(Ctmp.dot(xtmp.T)+Btmp.dot(X.T)))
+            exprate = self.bounded_exp(Ctmp.dot(xtmp.T)+Btmp.dot(X.T))
+            dL = (Ctmp.T).dot(ytmp.T)-Ctmp.T.dot(exprate)
         else:
             dL = Ctmp.T.dot(np.linalg.inv(Rtmp)).dot(ytmp.T-(Ctmp.dot(xtmp.T)+Btmp.dot(X.T)))
         return -dL.T.ravel()
@@ -336,7 +344,8 @@ class PLDS:
         # one trial
         H = self.block_matrix(self.H_log_lik(xtmp, Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson), offdiag=0) + \
             self.block_matrix(self.H_log_prior(xtmp, Atmp, Qtmp, Q0tmp), offdiag=1)
-
+        if np.sum(np.isnan(H))>0:
+            H = np.ones(H.shape)*99999999999
         '''
         tt = 0
         H = self.block_matrix(self.H_log_lik(Xtmp[:, :, tt], Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson), offdiag=0)+\
@@ -405,25 +414,69 @@ class PLDS:
                                     X=X, poisson=poisson)
 
     def inference(self, Xtmp0, Ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
-               X=None, poisson=True, disp=True): #, xtol=1e-05):
+               X=None, poisson=True, disp=True, gtol=1e-05, maxiter=100):
         if X is None:
             X = np.ones([Xtmp0.shape[0], 1, Xtmp0.shape[2]])
         xres = np.zeros(Xtmp0.shape)*np.nan
         for ttrial in range(Xtmp0.shape[2]):
             res = minimize(fun=self.wrap_x_posterior, x0=Xtmp0[:, :, ttrial].ravel(), method='BFGS', #method='Newton-CG',
-                           jac=self.wrap_x_Jposterior, #hess=self.wrap_x_Hposterior,
-                           options={'disp': disp}, # , 'xtol': xtol
-                           args=(Ytmp[:, :, ttrial],
-                                 Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp, X[:,:,ttrial],
-                                 poisson))
-            xres[:,:,ttrial] = res.x.reshape(Xtmp0.shape[0], Xtmp0.shape[1])
+                               jac=self.wrap_x_Jposterior, #hess=self.wrap_x_Hposterior,
+                               options={'disp': disp, 'gtol': gtol, 'maxiter':maxiter},
+                               args=(Ytmp[:, :, ttrial],
+                                     Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp, X[:,:,ttrial],
+                                     poisson))
+
+            if res.success == False:
+                print('    x did not converge with BFGS on trial ', ttrial, ', # iterations: ', res.nit)
+                print('    ', res.message)
+                '''res = minimize(fun=self.wrap_x_posterior, x0=Xtmp0[:, :, ttrial].ravel(),
+                               method='Newton-CG',
+                               jac=self.wrap_x_Jposterior,  hess=self.wrap_x_Hposterior,
+                               options={'disp': disp, 'gtol': gtol, 'maxiter': maxiter},
+                               args=(Ytmp[:, :, ttrial],
+                                     Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp, X[:, :, ttrial],
+                                     poisson))
+                print(res.x)
+                if res.success == False:
+                    print('       x did not converge with Newton-CG on trial ', ttrial, ', # iterations: ', res.nit)
+                    print('       ', res.message)'''
+            xres[:, :, ttrial] = res.x.reshape(Xtmp0.shape[0], Xtmp0.shape[1])
         return xres
+
+    def filter(self, x0tmp, Atmp, Q0tmp, Qtmp, data, Ctmp, Rtmp):
+        #### misses the offset from B !!! #########
+        n_step = data.shape[0]
+        # prior
+        m = [x0tmp]
+        [m.append(Atmp.dot(m[ii])) for ii in range(n_step)]
+        S = [Atmp.dot(Q0tmp.dot(Atmp.T))+Qtmp]
+        [S.append(Atmp.dot(S[ii].dot(Atmp.T))+Qtmp) for ii in range(n_step)]
+        # correction from data
+        corr = [data[tt,:]-Ctmp.dot(m[tt]) for tt in range(n_step)]
+        K = [S[tt].dot(Ctmp.T).dot(np.linalg.inv(Ctmp.dot(S[tt].dot(Ctmp.T))+Rtmp)) for tt in range(n_step)]
+        mc = [m[tt]+K[tt].dot(corr[tt]) for tt in range(n_step)]
+        Sc = [S[tt]-K[tt].dot(Ctmp.dot(S[tt])) for tt in range(n_step)]
+        return mc, Sc, S
+
+    def smooth(self, mc, Sc, S, Atmp):
+        n_step = len(mc)
+        J = [Sc[tt].dot(Atmp.T).dot(np.linalg.inv(S[tt+1])) for tt in range(n_step-1)]
+        ms = [mc[-1]]
+        [ms.append(mc[tt-1]+J[tt-1].dot(ms[n_step-tt-1]-Atmp.dot(mc[tt]))) for tt in range(n_step-1, 0, -1)]
+        ms.reverse()
+        Ss = [Sc[-1]]
+        [Ss.append(Sc[tt-1]+J[tt-1].dot(Ss[n_step-tt-1]-S[tt]).dot(J[tt-1].T)) for tt in range(n_step-1, 0, -1)]
+        Ss.reverse()
+        Sres = [[np.array(Ss[tt])] for tt in range(n_step)]
+        return ms, Sres
+
 
     ##################################################
     def bounded_exp(self, x, b=700):
         if np.any(x.ravel() > b):
-            x[x > b] = b
-            ex = np.exp(x)
+            #x[x > b] = b
+            #ex = np.exp(x)
+            ex = np.ones(x.shape)*np.nan
             print('numerical error in exponential')
         else:
             ex = np.exp(x)
@@ -440,41 +493,51 @@ class PLDS:
 
     # create mu(k) and sigma(k)
     def E_step(self, Xtmp0, Ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
-               X=None, poisson=True, disp=True): #, xtol=1e-05):
+               X=None, poisson=True, disp=True, gtol=1e-05, maxiter=100, analytic=False): #, xtol=1e-05):
         # computes the mean and the covariance of the true or approximated gaussian log posterior
         # covariance is the negative Hessian of the log posterior ("H_log_posterior" already computes the negative!!! because it is for the negative log posterior)
         # OUTPUT mu is an array T by xdim by #trials and sigma is a list of length #trials and entries iin block-list form with T blocks xdim by xdim
         if X is None:
             X = np.ones([Xtmp0.shape[0], 1, Xtmp0.shape[2]])
-        mu = self.inference(Xtmp0, Ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
-                            X=X, poisson=poisson, disp=disp) #, xtol=xtol)
-        # get the negative Hessian of the posterior
-        # then get its inverse
-        '''bla = [self.scipy_block(
-            self.H_log_posterior(mu[:, :, ttrial], Ytmp[:, :, ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
-                                 X=X[:, :, ttrial], poisson=poisson))
-                 for ttrial in range(Ytmp.shape[2])]'''
-        sigma = []
-        for ttrial in range(Ytmp.shape[2]):
-            try:
-                sigma.append(self.block_matrix_list(np.linalg.inv(
-                    self.H_log_posterior(mu[:, :, ttrial], Ytmp[:, :, ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp,
-                                         Rtmp=Rtmp,
-                                         X=X[:, :, ttrial], poisson=poisson)),
-                                                    mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1))
 
-                #sigma.append(self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
-                #                            X=X[:,:,ttrial], poisson=poisson)),
-                #                       np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1))
-            except:
-                print("\n !!!problem with inverting the hessian log posterior on trial %i!!!\n" %ttrial)
-                print(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
-                                            X=X[:,:,ttrial], poisson=poisson))
-                break
-        '''sigma = [self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
-                                            X=X[:,:,ttrial], poisson=poisson)),
-                                        np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1)
-                for ttrial in range(Ytmp.shape[2])]'''
+        if analytic&(poisson==False):
+            mu = np.zeros(Xtmp0.shape)*np.nan
+            sigma = []
+            for ttrial in range(Xtmp0.shape[2]):
+                mc, Sc, S = self.filter(x0tmp, Atmp, Q0tmp, Qtmp, Ytmp[:,:,ttrial], Ctmp, Rtmp)
+                ms, Ss= self.smooth(mc, Sc, S, Atmp)
+                mu[:, :, ttrial] = np.stack(ms)
+                sigma.append(Ss)
+
+        else:
+            print('   inference numerically')
+            mu = self.inference(Xtmp0, Ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+                                X=X, poisson=poisson, disp=disp, gtol=gtol, maxiter=maxiter)
+            # get the negative Hessian of the posterior
+            # then get its inverse
+            sigma = []
+            for ttrial in range(Ytmp.shape[2]):
+                try:
+                    sigma.append(self.block_matrix_list(np.linalg.inv(
+                        self.H_log_posterior(mu[:, :, ttrial], Ytmp[:, :, ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp,
+                                             Rtmp=Rtmp,
+                                             X=X[:, :, ttrial], poisson=poisson)),
+                                                        mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1))
+
+                    #sigma.append(self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+                    #                            X=X[:,:,ttrial], poisson=poisson)),
+                    #                       np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1))
+                except:
+                    print("\n !!!problem with inverting the hessian log posterior on trial %i!!!\n" %ttrial)
+                    print(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+                                                X=X[:,:,ttrial], poisson=poisson))
+                    break
+            '''sigma = [self.block_matrix_list(solveh_banded(self.scipy_block(self.H_log_posterior(mu[:,:,ttrial], Ytmp[:,:,ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=Rtmp,
+                                                X=X[:,:,ttrial], poisson=poisson)),
+                                            np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1)
+                    for ttrial in range(Ytmp.shape[2])]'''
+        print(len(sigma[0]))
+        print(sigma[0][Ytmp.shape[0]-1][0])
         return mu, sigma
 
     # helper function for scipy's inversion of blockwise matrices
@@ -559,17 +622,23 @@ class PLDS:
         return Bout.reshape(Ytmp.shape[1],1)
 
     # lower bound dependent on latent
-    def L_dyn(self, Xtmp, mu, sigma, x0tmp, Q0tmp):
+    def L_dyn(self, Xtmp, mu=None, sigma=None, x0tmp=None, Q0tmp=None, Qtmp=None, Atmp=None):
         # compute the NEGATIVE part of the lower bound that depends on the latent
         # prior
-        l0 = sum([-.5*np.log(np.linalg.det(Q0tmp))-.5*(Xtmp[0,:,kk]-x0tmp).dot(np.linalg.inv(Q0tmp)).dot(
+        l0 = sum([-.5*(Xtmp[0,:,kk]-x0tmp).T.dot(np.linalg.inv(Q0tmp)).dot(
                                             (Xtmp[0, :, kk] - x0tmp))
-                for kk in range(Xtmp.shape[2])])
+                for kk in range(Xtmp.shape[2])]) # -.5*np.log(np.linalg.det(Q0tmp))
+        ltt = sum([sum([ -
+                        .5 * (Xtmp[tt, :, kk] - np.matmul(Atmp,Xtmp[tt-1, :, kk])).T.dot(np.linalg.inv(Qtmp)).dot(
+            Xtmp[tt, :, kk] - np.matmul(Atmp,Xtmp[tt-1, :, kk]))
+                        for tt in range(Xtmp.shape[0])])
+                   for kk in range(Xtmp.shape[2])]) # -Xtmp.shape[0] / 2 * np.log(np.linalg.det(Qtmp))
+        '''
         ltt = sum([sum([-Xtmp.shape[0]/2*np.log(np.linalg.det(sigma[kk][tt][0]))-
                         .5*(Xtmp[tt,:,kk]-mu[tt,:,kk]).dot(np.linalg.inv(sigma[kk][tt][0])).dot(
                         (Xtmp[tt, :, kk] - mu[tt, :, kk]))
                         for tt in range(Xtmp.shape[0])])
-                   for kk in range(Xtmp.shape[2])])
+                   for kk in range(Xtmp.shape[2])])'''
         return -(l0+ltt)
 
     # lower bound dependent on observed
@@ -651,26 +720,32 @@ class PLDS:
         Ctmp = Ctmp0.reshape(Ytmp.shape[1], mu.shape[1])
         return self.J_L_obs_C(Ctmp, Btmp, Ytmp, mu, sigma, X=X, Rtmp=Rtmp, poisson=poisson).ravel()
 
-    def wrap_L_obs_B(self, Btmp0, Ctmp, Ytmp, mu, sigma, X, Rtmp=None, poisson=True):
+    def wrap_L_obs_B(self, Btmp0, Ctmp, Ytmp, mu, sigma, X, Rtmp=None, poisson=True, lam=1):
         Btmp = Btmp0.reshape(Ytmp.shape[1], X.shape[1])
-        return self.L_obs(Ctmp, Btmp, Ytmp, mu, sigma, X=X, Rtmp=Rtmp, poisson=poisson)
-    def wrap_J_L_obs_B(self, Btmp0, Ctmp, Ytmp, mu, sigma, X, Rtmp=None, poisson=True):
+        return self.L_obs(Ctmp, Btmp, Ytmp, mu, sigma, X=X, Rtmp=Rtmp, poisson=poisson)+\
+               np.ones(Ctmp.shape[0]).dot(Btmp0)*lam
+    def wrap_J_L_obs_B(self, Btmp0, Ctmp, Ytmp, mu, sigma, X, Rtmp=None, poisson=True, lam=1):
         Btmp = Btmp0.reshape(Ytmp.shape[1], X.shape[1])
-        return self.J_L_obs_B(Ctmp, Btmp, Ytmp, mu, sigma, X=X, Rtmp=Rtmp, poisson=poisson).ravel()
+        return self.J_L_obs_B(Ctmp, Btmp, Ytmp, mu, sigma, X=X, Rtmp=Rtmp, poisson=poisson).ravel()+ \
+               np.sum(Ctmp.shape[0]) * lam
 
     def upB(self, Btmp0, Ctmp, Ytmp, mu, sigma, X=None, Rtmp=None,
-            disp=True, gtol=1e-05, maxiter=100, poisson=True):
+            disp=True, gtol=1e-05, maxiter=100, poisson=True, lam=1):
         if X is None:
             X = np.ones([Ytmp.shape[0], 1, Ytmp.shape[2]])
         if (X.shape[1] == 1) & (np.mean(X) == 1):
-            print('B closed form solution')
+            print('    B closed form solution')
             # closed form solution if B is just an offset and X constant
             Bout = self.upd(Ctmp, Ytmp, mu, sigma, X=None, Btmp=Btmp0, poisson=poisson)
         else:
+            print('B: lambda= ', lam)
             res = minimize(fun=self.wrap_L_obs_B, x0=Btmp0.ravel(), method='BFGS',
                                jac=self.wrap_J_L_obs_B,
                                options={'disp': disp, 'gtol': gtol, 'maxiter':maxiter},
-                               args=(Ctmp, Ytmp, mu, sigma, X, Rtmp, poisson))
+                               args=(Ctmp, Ytmp, mu, sigma, X, Rtmp, poisson, lam))
+            if res.success==False:
+                print('    B did not converge, # iterations: ', res.nit)
+                print('    ', res.message)
             Bout = res.x.reshape(Ytmp.shape[1], X.shape[1])
         return Bout
 
@@ -682,6 +757,9 @@ class PLDS:
                        jac=self.wrap_J_L_obs_C,
                        options={'disp': disp, 'gtol': gtol, 'maxiter':maxiter},
                        args=(Btmp, Ytmp, mu, sigma, X, Rtmp, poisson))
+        if res.success == False:
+            print('    C did not converge, # iterations: ', res.nit)
+            print('    ', res.message)
         return res.x.reshape(Ytmp.shape[1], mu.shape[1])
 
 #######################################################################
@@ -695,9 +773,9 @@ class EM:
         self.gtol = gtol
         self.maxiter = maxiter
 
-    def starters(self, xdim, ydim, sdim, seed,
+    def starters(self, data, xdim, ydim, sdim, seed,
                  C=None, Q0=None, A=None, Q=None, x0=None, B=None, R=None,
-                 cscal=2, sigQ = 0.001 , a=.1, sigR=.1):
+                 cscal=2, sigQ = 0.001 , a=.1, sigR=.1, upB=True, upx0=True):
         # here intelligent ways of choosing starting parameters
         # can be implemented
         np.random.seed(seed)
@@ -706,20 +784,23 @@ class EM:
         else:
             self.A=A
         if Q is None:
-            self.Q = np.eye(xdim) * sigQ
+            self.Q = np.eye(xdim)
         else:
             self.Q=Q
         if Q0 is None:
             self.Q0 = np.eye(xdim) * sigQ
         else:
             self.Q0=Q0
-        if x0 is None:
+        if (x0 is None)&upx0:
             self.x0 = np.random.randn(xdim)
+        elif (x0 is None)&(upx0==False):
+            self.x0 = np.zeros(xdim)
         else:
             self.x0 = x0
         # observed
         if C is None:
-            self.C = cscal * np.random.rand(ydim * xdim).reshape(ydim, xdim)
+            fa = FactorAnalysis(n_components=xdim).fit(unroll(data))
+            self.C = fa.components_.T/np.sqrt(np.sum(fa.components_**2))* cscal # * np.random.rand(ydim * xdim).reshape(ydim, xdim)
         else:
             self.C = C
         if R is None:
@@ -728,7 +809,10 @@ class EM:
             self.R = R
         # stimulus
         if B is None:
-            self.B = cscal * np.random.randn(ydim, sdim)
+            if upB:
+                self.B = np.random.randn(ydim, sdim) # cscal *
+            else:
+                self.B = np.zeros([ydim, sdim])
         else:
             self.B = B
 
@@ -741,82 +825,143 @@ class EM:
 
     def fit(self, data, xdim, poisson, seed, maxiterem = 10, ltol=1e-1,
             C=None, Q0=None, A=None, Q=None, x0=None, B=None, R=None, S=None,
-            cscal=2, sigQ = 0.001 , a=.1, sigR=.1):
+            cscal=2, sigQ = 0.001 , a=.1, sigR=.1, upB=True, upx0=True, degeneracyfix=True, analytic=False):
+        # ltol is a parameter that indicates when (if) to stop the loop of em iterations earlier because there is no
+        # improvement in the likelihood bound --> has to be positive
+
         # expect data to be T by ydim by Trials
         if S is None:
             S = np.ones([data.shape[0], 1, data.shape[2]])
         # starting parameters:
-        self.starters(xdim, data.shape[1], S.shape[1], seed,
+        self.starters(data, xdim, data.shape[1], S.shape[1], seed,
                  C=C, Q0=Q0, A=A, Q=Q, x0=x0, B=B, R=R,
-                 cscal=cscal, sigQ = sigQ , a=a, sigR=sigR)
+                 cscal=cscal, sigQ = sigQ , a=a, sigR=sigR, upB=upB, upx0=upx0)
         MOD0 = PLDS(xdim, data.shape[1], n_step=[data.shape[0]],
                     C=self.C, Q0=self.Q0, A=self.A, Q=self.Q, x0=self.x0,
                     B=self.B, R=self.R,Ttrials=data.shape[2])
         MOD0.x = np.random.randn(np.max(MOD0.n_step), MOD0.xdim, MOD0.Ttrials)
+        backtrack=False
         start = time.time()
         for ii in range(maxiterem):
             print('--- iter '+np.str(ii+1)+' ---')
             start_ii = time.time()
+            
             ##### E-step #####
+            print('    E-step')
             mu, sigma = MOD0.E_step(MOD0.x, data, MOD0.B, MOD0.C, MOD0.A, MOD0.Q,
                                    MOD0.Q0, MOD0.x0, MOD0.R, X=S,
-                                   poisson=poisson, disp=False)
+                                   poisson=poisson, disp=False, gtol=self.gtol, maxiter=self.maxiter, analytic=analytic)
             # update latent
             MOD0.x = mu.copy()
             if ii==0:
-                # lower bound before first update (misses the latent part)
+                # lower bound before first update
                 L0 = [[MOD0.L_obs(MOD0.C, MOD0.B, data, mu, sigma, X=S, Rtmp=MOD0.R, poisson=poisson),
-                      MOD0.L_dyn(MOD0.x, mu, sigma, MOD0.x0, MOD0.Q0)]]
+                      MOD0.L_dyn(MOD0.x, mu, sigma, MOD0.x0, MOD0.Q0, MOD0.Q, MOD0.A)]]
                 print('   lower bound at start ', sum(L0[-1]))
-            # make a backup
+            # update the backup
             MOD_back = self.backup(MOD0)
             ##### M-step #####
+            print('    M-step')
             # update parameters for latent
-            MOD0.x0 = MOD0.upx0(mu)
+            if upx0: MOD0.x0 = MOD0.upx0(mu)
             MOD0.Q0 = MOD0.upQ0(MOD0.x0, mu, [sigma[kk][0][0] for kk in range(MOD0.Ttrials)])
             MOD0.A = MOD0.upA(mu, sigma)
             MOD0.Q = MOD0.upQ(MOD0.A, mu, sigma)
             # update parameters for observed
-            MOD0.B = MOD0.upB(MOD0.B, MOD0.C, data, mu, sigma, X=S, Rtmp=MOD0.R,
-                            disp=False, gtol=self.gtol, maxiter=self.maxiter, poisson=poisson)
+            if upB:
+                MOD0.B = MOD0.upB(MOD0.B, MOD0.C, data, mu, sigma, X=S, Rtmp=MOD0.R,
+                                disp=False, gtol=self.gtol, maxiter=self.maxiter, poisson=poisson)
             MOD0.C = MOD0.upC(MOD0.C, MOD0.B, data, mu, sigma, X=S, Rtmp=MOD0.R,
                             disp=False, gtol=self.gtol, maxiter=self.maxiter, poisson=poisson)
-            # update lower bound
+
+            ##### update lower bound
             L0.append([MOD0.L_obs(MOD0.C, MOD0.B, data, mu, sigma, X=S, Rtmp=MOD0.R, poisson=poisson),
-                      MOD0.L_dyn(MOD0.x, mu, sigma, MOD0.x0, MOD0.Q0)])
-            print('   lower bound after iteration ', ii, ': ', sum(L0[-1]))
-            print('     decrease achieved (old neglik - new neglik): ', (sum(L0[ii])-sum(L0[ii+1])))
-            if (sum(L0[ii])-sum(L0[ii+1]))<=ltol:
-                print('----------\n stopped early at iteration', ii, ': ')
-                print('difference in last two lower bounds: ', sum(L0[ii])-sum(L0[ii+1]))
-                print('   neg lower bound for observed went from ', L0[ii][0], ' to ', L0[ii+1][0])
-                print('   neg lower bound for latent went from ', L0[ii][1], ' to ', L0[ii+1][1])
-                break
+                       MOD0.L_dyn(MOD0.x, mu, sigma, MOD0.x0, MOD0.Q0, MOD0.Q, MOD0.A)])
+
+            print('   lower bound after iteration ', ii + 1, ': ', sum(L0[-1]))
+            if ((sum(L0[ii]) - sum(L0[ii + 1]))) > 0:
+                print('     decrease achieved (old neglik - new neglik): ', (sum(L0[ii]) - sum(L0[ii + 1])))
             else:
-                del MOD_back
-            end_ii = time.time()
-            print('time needed: ', end_ii-start_ii)
-            # make sure A does not increase above 1 (otherwise divergence)
-            if (MOD0.xdim==1):
-                if (MOD0.A>1):
+                print('     !!! LL increased (old neglik - new neglik): ', (sum(L0[ii]) - sum(L0[ii + 1])))
+
+            ##### take care of the degeneracy
+            if degeneracyfix:
+
+                print('   take care of degeneracy')
+                print('   Q=', np.linalg.eigvals(MOD0.Q))
+                if any(np.linalg.eigvals(MOD0.Q)<=0):
+                    print('Q is not positive definite, backtracking!')
+                    backtrack=True
+                    break
+                invQ = np.linalg.pinv(np.linalg.cholesky(MOD0.Q))
+                for kk in range(MOD0.x.shape[2]):
+                    MOD0.x[:,:,kk] = (invQ.dot(MOD0.x[:,:,kk].T)).T
+                MOD0.C = MOD0.C.dot(np.linalg.cholesky(MOD0.Q))
+                MOD0.x0 = (invQ.dot(MOD0.x0)).T
+                MOD0.Q0 = invQ.dot(MOD0.Q0.dot(invQ.T))
+                MOD0.Q = np.eye(xdim)
+
+                #print('   Q=', np.linalg.eigvals(MOD0.Q))
+                #mud, sigmad = MOD0.E_step(MOD0.x, data, MOD0.B, MOD0.C, MOD0.A, MOD0.Q,
+                #                       MOD0.Q0, MOD0.x0, MOD0.R, X=S,
+                #                     poisson=poisson, disp=False)
+
+            ##### make sure A does not increase above 1 (otherwise divergence)
+            if (MOD0.xdim == 1):
+                if (MOD0.A > 1):
                     print('(correcting A to be <1)')
-                    MOD0.A=.99
-            elif any(np.linalg.eigvals(MOD0.A) > 1):
+                    MOD0.A = .99
+            elif any(np.linalg.svd(MOD0.A)[1] > 1):
                 print('(correcting A to be <1)')
                 u, s, v = np.linalg.svd(MOD0.A)
                 s[s >= 1] = .99
-                MOD0.A = np.real(u.dot(np.diag(s)).dot(v))
+                MOD0.A = u.dot(np.diag(s)).dot(v)
+            '''if degeneracyfix:
+                print('   ... $LL_{prior}$ before degeneracy removing :',
+                      MOD_deg.L_dyn(MOD_deg.x, None, None, MOD_deg.x0, MOD_deg.Q0, MOD_deg.Q, MOD_deg.A))
+                print('   ... $LL_{prior}$ after degeneracy removing :',
+                       MOD0.L_dyn(MOD0.x, None, None, MOD0.x0, MOD0.Q0, MOD0.Q, MOD0.A))'''
+            if ((np.isnan(L0[-1][0]))|(np.isnan(L0[-1][1]))|((sum(L0[ii])-sum(L0[ii+1]))<=ltol)):
+                
+                print('----------\n stopped early at iteration', ii+1, ': ')
+                print('difference in last two lower bounds: ', sum(L0[ii])-sum(L0[ii+1]))
+                print('   neg lower bound for observed went from ', L0[ii][0], ' to ', L0[ii+1][0])
+                print('   neg lower bound for latent went from ', L0[ii][1], ' to ', L0[ii+1][1])
+                if (sum(L0[ii])<sum(L0[ii+1])):
+                    # if there was an increase in the bound --> backtrack and analyze
+                    backtrack = True
+                    print('   max C: ', np.max(np.abs(MOD0.C)))
+                    print('   max x: ', np.max(np.abs(MOD0.x)))
+                    print('   max B: ', np.max(MOD0.B))
+                    fig, ax = plt.subplots(1, 3, figsize=(15, 4))
+                    ax[0].plot(MOD0.C)
+                    ax[0].set_title('C')
+                    ax[1].plot(unroll(MOD0.x))
+                    ax[1].set_title('x')
+                    ax[2].plot(MOD0.B)
+                    ax[2].set_title('B')
+                break
+            #else:
+            #    del MOD_back
 
+            # end time
+            end_ii = time.time()
+            print('time needed: ', end_ii-start_ii)
+        
         end = time.time()
         print('time total needed ', end-start)
-        if sum(L0[-2])<sum(L0[-1]):
+        if backtrack: #(stopLL)&((np.isnan(L0[-1][0]))|(np.isnan(L0[-1][1]))|(sum(L0[-2])<sum(L0[-1]))):
             print('last iteration did not improve fit, instead returning previous iteration parameters')
-            return MOD_back
+            #mu, _ = MOD_back.E_step(MOD_back.x, data, MOD_back.B, MOD_back.C, MOD_back.A, MOD_back.Q,
+            #                MOD_back.Q0, MOD_back.x0, MOD_back.R, X=S,
+            #                poisson=poisson, disp=False)
+            #MOD_back.x = mu.copy()
+            return MOD_back, None
         else:
             MOD0.x, sigma = MOD0.E_step(MOD0.x, data, MOD0.B, MOD0.C, MOD0.A, MOD0.Q,
-                                    MOD0.Q0, MOD0.x0, MOD0.R, X=S,
-                                    poisson=poisson, disp=False)
-            return MOD0, sigma
+                                MOD0.Q0, MOD0.x0, MOD0.R, X=S,
+                                poisson=poisson, disp=False, gtol=self.gtol, maxiter=self.maxiter)
+        return MOD0, sigma
 
     def reconstruction(self, data_test, S_test, MOD0, poisson=True, neurons=None):
         # leave one neuron out, infer the latent from the remaining population
@@ -847,7 +992,7 @@ class EM:
             MOD_nn.x = np.random.randn(np.max(MOD_nn.n_step), MOD_nn.xdim, MOD_nn.Ttrials)*.1
             mu, sigma = MOD_nn.E_step(MOD_nn.x, data_nn, MOD_nn.B, MOD_nn.C, MOD_nn.A, MOD_nn.Q,
                                       MOD_nn.Q0, MOD_nn.x0, MOD_nn.R, X=S_test,
-                                      poisson=poisson, disp=False)
+                                      poisson=poisson, disp=False, gtol=self.gtol, maxiter=self.maxiter)
             # predict the left out neuron's activity
             if poisson:
                 for tt in range(MOD_nn.Ttrials):
