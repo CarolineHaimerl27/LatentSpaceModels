@@ -17,6 +17,12 @@ def unroll(data):
     tmp = np.concatenate((tmp))
     return tmp
 
+def roll(data, n_step, Ttrials):
+    out = np.zeros([n_step, data.shape[1], Ttrials])
+    for kk in range(Ttrials):
+        out[:,:,kk] = data[(kk*n_step):((kk+1)*n_step),:]
+    return out
+
 class PLDS:
     
     def __init__(self, xdim, ydim, n_step, C, Q0, A, Q, x0, B, R,
@@ -536,8 +542,8 @@ class PLDS:
                                                 X=X[:,:,ttrial], poisson=poisson)),
                                             np.eye(Xtmp0.shape[0]*Xtmp0.shape[1]), lower=True), mdim=[Xtmp0.shape[1], Xtmp0.shape[1]], offdiag=1)
                     for ttrial in range(Ytmp.shape[2])]'''
-        print(len(sigma[0]))
-        print(sigma[0][Ytmp.shape[0]-1][0])
+        #print(len(sigma[0]))
+        #print(sigma[0][Ytmp.shape[0]-1][0])
         return mu, sigma
 
     # helper function for scipy's inversion of blockwise matrices
@@ -769,7 +775,7 @@ class PLDS:
 class EM:
 
     def __init__(self, gtol=1e-05, maxiter=10):
-        # optimization parameters for numerical fitting for C and B
+        # optimization parameters for numerical fitting for C and B and inference if numerical
         self.gtol = gtol
         self.maxiter = maxiter
 
@@ -801,8 +807,10 @@ class EM:
         if C is None:
             fa = FactorAnalysis(n_components=xdim).fit(unroll(data))
             self.C = fa.components_.T/np.sqrt(np.sum(fa.components_**2))* cscal # * np.random.rand(ydim * xdim).reshape(ydim, xdim)
+            xfa = fa.transform(unroll(data))
         else:
             self.C = C
+            xfa = None
         if R is None:
             self.R = np.eye(ydim) * sigR
         else:
@@ -815,6 +823,7 @@ class EM:
                 self.B = np.zeros([ydim, sdim])
         else:
             self.B = B
+        return xfa
 
     def backup(self, MOD0):
         MOD_back = PLDS(MOD0.xdim, MOD0.ydim, n_step=MOD0.n_step,
@@ -833,17 +842,20 @@ class EM:
         if S is None:
             S = np.ones([data.shape[0], 1, data.shape[2]])
         # starting parameters:
-        self.starters(data, xdim, data.shape[1], S.shape[1], seed,
+        xfa = self.starters(data, xdim, data.shape[1], S.shape[1], seed,
                  C=C, Q0=Q0, A=A, Q=Q, x0=x0, B=B, R=R,
                  cscal=cscal, sigQ = sigQ , a=a, sigR=sigR, upB=upB, upx0=upx0)
         MOD0 = PLDS(xdim, data.shape[1], n_step=[data.shape[0]],
                     C=self.C, Q0=self.Q0, A=self.A, Q=self.Q, x0=self.x0,
                     B=self.B, R=self.R,Ttrials=data.shape[2])
-        MOD0.x = np.random.randn(np.max(MOD0.n_step), MOD0.xdim, MOD0.Ttrials)
+        if xfa is None:
+            MOD0.x = np.random.randn(np.max(MOD0.n_step), MOD0.xdim, MOD0.Ttrials)
+        else:
+            MOD0.x = roll(xfa, data.shape[0], data.shape[2])
         backtrack=False
         start = time.time()
         for ii in range(maxiterem):
-            print('--- iter '+np.str(ii+1)+' ---')
+            print('------- iter '+np.str(ii+1)+' -------')
             start_ii = time.time()
             
             ##### E-step #####
@@ -857,9 +869,10 @@ class EM:
                 # lower bound before first update
                 L0 = [[MOD0.L_obs(MOD0.C, MOD0.B, data, mu, sigma, X=S, Rtmp=MOD0.R, poisson=poisson),
                       MOD0.L_dyn(MOD0.x, mu, sigma, MOD0.x0, MOD0.Q0, MOD0.Q, MOD0.A)]]
-                print('   lower bound at start ', sum(L0[-1]))
+                print('   lower bound after first inference ', sum(L0[-1]))
             # update the backup
             MOD_back = self.backup(MOD0)
+            sigma_old = sigma.copy()
             ##### M-step #####
             print('    M-step')
             # update parameters for latent
@@ -878,28 +891,27 @@ class EM:
             L0.append([MOD0.L_obs(MOD0.C, MOD0.B, data, mu, sigma, X=S, Rtmp=MOD0.R, poisson=poisson),
                        MOD0.L_dyn(MOD0.x, mu, sigma, MOD0.x0, MOD0.Q0, MOD0.Q, MOD0.A)])
 
-            print('   lower bound after iteration ', ii + 1, ': ', sum(L0[-1]))
+            print('    lower bound after iteration ', ii + 1, ': ', sum(L0[-1]))
             if ((sum(L0[ii]) - sum(L0[ii + 1]))) > 0:
                 print('     decrease achieved (old neglik - new neglik): ', (sum(L0[ii]) - sum(L0[ii + 1])))
             else:
                 print('     !!! LL increased (old neglik - new neglik): ', (sum(L0[ii]) - sum(L0[ii + 1])))
-
+            print('    eigenvalues Q=', np.linalg.eigvals(MOD0.Q))
             ##### take care of the degeneracy
             if degeneracyfix:
-
                 print('   take care of degeneracy')
-                print('   Q=', np.linalg.eigvals(MOD0.Q))
+                #print('   Q=', np.linalg.eigvals(MOD0.Q))
                 if any(np.linalg.eigvals(MOD0.Q)<=0):
                     print('Q is not positive definite, backtracking!')
                     backtrack=True
                     break
-                invQ = np.linalg.pinv(np.linalg.cholesky(MOD0.Q))
+                invQ = np.linalg.pinv(np.linalg.cholesky(MOD0.Q))*sigQ
                 for kk in range(MOD0.x.shape[2]):
                     MOD0.x[:,:,kk] = (invQ.dot(MOD0.x[:,:,kk].T)).T
-                MOD0.C = MOD0.C.dot(np.linalg.cholesky(MOD0.Q))
+                MOD0.C = MOD0.C.dot(np.linalg.cholesky(MOD0.Q)/sigQ)
                 MOD0.x0 = (invQ.dot(MOD0.x0)).T
                 MOD0.Q0 = invQ.dot(MOD0.Q0.dot(invQ.T))
-                MOD0.Q = np.eye(xdim)
+                MOD0.Q = np.eye(xdim)*sigQ
 
                 #print('   Q=', np.linalg.eigvals(MOD0.Q))
                 #mud, sigmad = MOD0.E_step(MOD0.x, data, MOD0.B, MOD0.C, MOD0.A, MOD0.Q,
@@ -912,18 +924,20 @@ class EM:
                     print('(correcting A to be <1)')
                     MOD0.A = .99
             elif any(np.linalg.svd(MOD0.A)[1] > 1):
-                print('(correcting A to be <1)')
+                print('     (correcting A to be <1)')
+                print('     singular values of A: ', np.linalg.svd(MOD0.A)[1])
                 u, s, v = np.linalg.svd(MOD0.A)
                 s[s >= 1] = .99
                 MOD0.A = u.dot(np.diag(s)).dot(v)
+
+            ##### recompute the bounds
             '''if degeneracyfix:
                 print('   ... $LL_{prior}$ before degeneracy removing :',
                       MOD_deg.L_dyn(MOD_deg.x, None, None, MOD_deg.x0, MOD_deg.Q0, MOD_deg.Q, MOD_deg.A))
                 print('   ... $LL_{prior}$ after degeneracy removing :',
                        MOD0.L_dyn(MOD0.x, None, None, MOD0.x0, MOD0.Q0, MOD0.Q, MOD0.A))'''
-            if ((np.isnan(L0[-1][0]))|(np.isnan(L0[-1][1]))|((sum(L0[ii])-sum(L0[ii+1]))<=ltol)):
-                
-                print('----------\n stopped early at iteration', ii+1, ': ')
+            if (ii>0)&((np.isnan(L0[-1][0]))|(np.isnan(L0[-1][1]))|((sum(L0[ii])-sum(L0[ii+1]))<=ltol)):
+                print('stopped early at iteration', ii+1, ': ')
                 print('difference in last two lower bounds: ', sum(L0[ii])-sum(L0[ii+1]))
                 print('   neg lower bound for observed went from ', L0[ii][0], ' to ', L0[ii+1][0])
                 print('   neg lower bound for latent went from ', L0[ii][1], ' to ', L0[ii+1][1])
@@ -956,7 +970,7 @@ class EM:
             #                MOD_back.Q0, MOD_back.x0, MOD_back.R, X=S,
             #                poisson=poisson, disp=False)
             #MOD_back.x = mu.copy()
-            return MOD_back, None
+            return MOD_back, sigma_old
         else:
             MOD0.x, sigma = MOD0.E_step(MOD0.x, data, MOD0.B, MOD0.C, MOD0.A, MOD0.Q,
                                 MOD0.Q0, MOD0.x0, MOD0.R, X=S,
