@@ -12,38 +12,72 @@ from scipy.optimize import minimize
 from scipy.linalg import solveh_banded
 from sklearn.decomposition import FactorAnalysis
 
+#######################################################################
+###################### helper fun #####################################
+#######################################################################
+
 def unroll(data):
+    # takes tensor and transforms to array by stacking along the 3rd dimension
+    # input: data which is T by N by Ttrials (T is # time points, N is dimensionality)
+    # output: T*Ttrials by N
     tmp = [data[:,:,kk] for kk in range(data.shape[2])]
     tmp = np.concatenate((tmp))
     return tmp
 
-def roll(data, n_step, Ttrials):
+def roll(data, n_step, Ttrials=None):
+    # inverse of "unroll", takes an array and creates a tensor
+    if Ttrials is None:
+        Ttrials = int(data.shape[0]/n_step)
     out = np.zeros([n_step, data.shape[1], Ttrials])
     for kk in range(Ttrials):
         out[:,:,kk] = data[(kk*n_step):((kk+1)*n_step),:]
     return out
 
+def print_par(MOD, obs=False):
+    print('---- latent var parameters ------')
+    print('A: ', np.linalg.eigvals(MOD.A))
+    print('Q: ', np.linalg.eigvals(MOD.Q))
+    print('---- prior parameters -----------')
+    print('x0: ', MOD.x0)
+    print('Q0: ', np.linalg.eigvals(MOD.Q0))
+    if obs:
+        print('---- observed var parameters ----')
+        print('C: ', MOD.C)
+        print('B: ', MOD.B)
+    print(' ')
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[91m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+#######################################################################
+######################### PLDS class ##################################
+#######################################################################
+
 class PLDS:
     
-    def __init__(self, xdim, ydim, n_step, C, Q0, A, Q, x0, B, R,
-           #estA=None, estC=None, estQ=None, estQ0=None, estx0=None, estB = None, scal = .1,
-           Ttrials=1):
+    def __init__(self, xdim, ydim, sdim, n_step, C, Q0, A, Q, x0, B, R, Ttrials=1):
         #### model hyperparameters ####
         # number of trials
         self.Ttrials = Ttrials
         # maximum number of time points in a trial
         self.maxn_step = np.max(n_step)
         # number of time points sampled in each trial
-        if (len(n_step)==1) & (Ttrials>1):
-            self.n_step = np.repeat(n_step, Ttrials)
+        if (len(n_step)==1) & (self.Ttrials>1):
+            self.n_step = np.repeat(n_step, self.Ttrials)
         else:
             self.n_step = n_step
-        # xdim = number of latent dimensions
-        # ydim = number of observed dimensions
-        if xdim<1:
-            print('invalid number of latent dimensions! (<1)')
-        self.xdim = xdim
-        self.ydim = ydim
+        # x = latent, y = observed, s = stimulus
+        if (xdim<1)|(ydim<1)|(sdim<1):
+            print('invalid number of dimensions! (<1)')
+        self.xdim, self.ydim, self.sdim = xdim, ydim, sdim
         #### ground truth parameters ####
         # C = mapping function
         self.C = C
@@ -57,21 +91,105 @@ class PLDS:
         self.x0 = x0
         # if Gaussian noise, observable noise term
         self.R = R
-
         # B = stimulus coefficients
         if B is None:
-            self.B = None
+            self.B = np.ones([self.ydim, self.sdim])
         else:
             self.B = B
 
 
-    def sample(self, X=None, seed=None, poisson=True):
-        # X = stimulus matrix of the form time points x dimensions x trials
-        if X is None:
+    def test_log_lik(self, xtmp, Btmp, Ctmp, X=None, Rtmp=None, poisson=True):
+        # test that the negative likelihood is lower if there is a noiseless x-data relationship
+        # than if there was a DIFFERENT x
+        if X is None: X = np.ones([xtmp.shape[0], 1])
+        if poisson:
+            ytest = np.exp(Ctmp.dot(xtmp.T) + Btmp.dot(X.T)).T
+        else:
+            ytest = (Ctmp.dot(xtmp.T)).T
+        lik_noiseless = self.log_lik(xtmp, ytest, Btmp, Ctmp, X=X, Rtmp=Rtmp, poisson=poisson)
+        lik_otherx = self.log_lik(xtmp+.1*np.random.randn(xtmp.shape[0], xtmp.shape[1]),
+                                  ytest, Btmp, Ctmp, X=X, Rtmp=Rtmp, poisson=poisson)
+        if lik_otherx>lik_noiseless:
+            print(bcolors.OKGREEN+'----- TEST PASSED -----')
+        else:
+            print(bcolors.WARNING+'----- TEST FAILED -----')
+            print('noiseless data likelihood: ', lik_noiseless)
+            print('noise added to latent, same y: ', lik_otherx)
+
+    def test_log_prior(self, xtmp, Atmp, Qtmp, Q0tmp, x0tmp):
+        # tests that the prior probability of x is less than if it was exactly mu
+        prior0 = self.log_prior(xtmp, Atmp, Qtmp, Q0tmp, x0tmp)
+        xtest = np.zeros(xtmp.shape)*np.nan
+        xtest[0,:] = x0tmp.copy()
+        for tt in range(1,xtest.shape[0]):
+            xtest[tt,:] = Atmp.dot(xtest[tt-1,:])
+        priortest = self.log_prior(xtest, Atmp, Qtmp, Q0tmp, x0tmp)
+        if (priortest<prior0)&(prior0>=0)&(np.abs(priortest)<1e-8):
+            print(bcolors.OKGREEN+'----- TEST PASSED -----')
+        else:
+            print(bcolors.WARNING+'----- TEST FAILED -----')
+
+    def test_J_log_prior(self, xtmp, Atmp, Qtmp, Q0tmp, x0tmp):
+        # tests that the derivative of the prior probability of x is less than if it was exactly mu
+        # and that it is 0 when x=mu
+        prior0 = np.sum(self.J_log_prior(xtmp, Atmp, Qtmp, Q0tmp, x0tmp) ** 2)
+        xtest = np.zeros(xtmp.shape) * np.nan
+        xtest[0, :] = x0tmp.copy()
+        for tt in range(1, xtest.shape[0]):
+            xtest[tt, :] = Atmp.dot(xtest[tt - 1, :])
+        priortest = np.sum(self.J_log_prior(xtest, Atmp, Qtmp, Q0tmp, x0tmp) ** 2)
+        if (priortest < prior0) & (prior0 >= 0) & (np.abs(priortest) < 1e-8):
+            print(bcolors.OKGREEN + '----- TEST PASSED -----')
+        else:
+            print(bcolors.WARNING + '----- TEST FAILED -----')
+
+    def test_J_log_lik(self, xtmp, Btmp, Ctmp, Rtmp=None, X=None, poisson=True):
+        # tests that the derivative of the likelihood of y if y is exactly what's expected under x
+        # gives 0 (indicating an extrema)
+        if X is None: X = np.ones([xtmp.shape[0], 1])
+        if poisson:
+            ytest = np.exp(Ctmp.dot(xtmp.T) + Btmp.dot(X.T)).T
+        else:
+            ytest = (Ctmp.dot(xtmp.T) + Btmp.dot(X.T)).T
+        lik0 = self.J_log_lik(xtmp, ytest, Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson)
+        if np.abs(np.sum(lik0 ** 2)) < 1e-8:
+            print(bcolors.OKGREEN + '----- TEST PASSED -----')
+        else:
+            print(bcolors.WARNING + '----- TEST FAILED -----')
+            print(lik0)
+
+    def test_H_log_prior(self, xtmp, Atmp, Qtmp, Q0tmp):
+        # tests that the Hessian of the prior probability of x is positive-semidefinite
+        # and that it is 0 when x=mu
+        Heig = np.linalg.eigvals(self.block_matrix(self.H_log_prior(xtmp, Atmp, Qtmp, Q0tmp), offdiag=1))
+        if np.mean(Heig>=0)==1:
+            print(bcolors.OKGREEN + '----- TEST PASSED -----')
+        else:
+            print(bcolors.WARNING + '----- TEST FAILED -----')
+
+    def test_H_log_lik(self, xtmp, Btmp, Ctmp, Rtmp=None, X=None, poisson=True):
+        # tests that the Hessian of the likelihood of y|x is positive-semidefinite
+        # and that it is 0 when x=mu
+        Heig = np.linalg.eigvals(self.block_matrix(self.H_log_lik(xtmp, Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson), offdiag=0))
+        if np.mean(Heig>=0)==1:
+            print(bcolors.OKGREEN + '----- TEST PASSED -----')
+        else:
+            print(bcolors.WARNING + '----- TEST FAILED -----')
+
+    def test_block(self, M, mdim, offdiag=0):
+        # input is matrix
+        if np.mean(self.block_matrix(self.block_matrix_list(M, mdim, offdiag),offdiag)==M)==1:
+            print(bcolors.OKGREEN + '----- TEST PASSED -----')
+        else:
+            print(bcolors.WARNING + '----- TEST FAILED -----')
+
+    def sample(self, S=None, seed=None, poisson=True):
+        # S = stimulus matrix of the form time points x dimensions x trials
+        if S is None:
             # if none -> only baseline firing rate, no stimulus
-            X = np.ones([self.maxn_step, 1, self.Ttrials])
+            S = np.ones([self.maxn_step, 1, self.Ttrials])
             for tt in range(self.Ttrials):
-                X[self.n_step[tt]:, :, tt] = np.nan
+                S[self.n_step[tt]:, :, tt] = np.nan
         if seed is not None:
             np.random.seed(seed)
         # placeholders for latent x and observed y
@@ -80,7 +198,7 @@ class PLDS:
         # cycle through trials (may differ in length!)
         for ttrials in range(self.Ttrials):
             # stimulus drive in log space
-            d = (self.B.dot(X[:self.n_step[ttrials],:, ttrials].T)).T
+            d = (self.B.dot(S[:self.n_step[ttrials],:, ttrials].T)).T
             # initialize the latent
             if self.xdim == 1:
                 xold = self.x0 + np.sqrt(self.Q0) * np.random.randn(1)
@@ -153,64 +271,39 @@ class PLDS:
             L = np.sum(np.diag(-.5*(ytmp.T-lograte).T.dot(np.linalg.inv(Rtmp)).dot(ytmp.T-lograte)))
         return -L
 
-    def test_log_lik(self, xtmp, Btmp, Ctmp, X=None, Rtmp=None, poisson=True):
-        # test that the negative likelihood is lower if there is a noiseless x-data relationship
-        # than if there was a DIFFERENT x
-        if X is None: X = np.ones([xtmp.shape[0], 1])
-        if poisson:
-            ytest = np.exp(Ctmp.dot(xtmp.T) + Btmp.dot(X.T)).T
-        else:
-            ytest = (Ctmp.dot(xtmp.T)).T
-        lik_noiseless = self.log_lik(xtmp, ytest, Btmp, Ctmp, X=X, Rtmp=Rtmp, poisson=poisson)
-        lik_otherx = self.log_lik(xtmp+.1*np.random.randn(xtmp.shape[0], xtmp.shape[1]),
-                                  ytest, Btmp, Ctmp, X=X, Rtmp=Rtmp, poisson=poisson)
-        if lik_otherx>lik_noiseless:
-            print(bcolors.OKGREEN+'----- TEST PASSED -----')
-        else:
-            print(bcolors.WARNING+'----- TEST FAILED -----')
-            print('noiseless data likelihood: ', lik_noiseless)
-            print('noise added to latent, same y: ', lik_otherx)
-
     def log_prior(self, xtmp, Atmp, Qtmp, Q0tmp, x0tmp):
         # computes the negative log prior of the latent: -logP(x)
         # xtmp is expected to be T by xdim
         mu = self.prior_mu(Atmp, x0tmp, xtmp.shape[0])
         sigma_inv = self.prior_sigma_inv(Atmp, Qtmp, Q0tmp, xtmp.shape[0])
         # diagonal
-        L1 = [-(xtmp[tt,:]-mu[tt]).dot(sigma_inv[tt][0]).dot(xtmp[tt,:]-mu[tt]) \
+        L1 = [-(xtmp[tt,:]-mu[tt]).dot(sigma_inv[tt][1]).dot(xtmp[tt,:]-mu[tt]) \
              for tt in range(xtmp.shape[0])]
-        # off diagonal
-        L2_right = [- (xtmp[tt+1, :] - mu[tt+1]).dot(sigma_inv[tt+1][1]).dot(xtmp[tt, :] - mu[tt]) \
+        # upper (right) diagonal
+        L2_right = [- (xtmp[tt+1, :] - mu[tt+1]).dot(sigma_inv[tt+1][2]).dot(xtmp[tt, :] - mu[tt]) \
               for tt in range(xtmp.shape[0]-1)]
-        L2_left = [- (xtmp[tt -1, :] - mu[tt -1]).dot(sigma_inv[tt][1]).dot(xtmp[tt, :] - mu[tt]) \
+        # lower (left) diagonal
+        L2_left = [- (xtmp[tt -1, :] - mu[tt -1]).dot(sigma_inv[tt][0]).dot(xtmp[tt, :] - mu[tt]) \
                     for tt in range(1,xtmp.shape[0])]
         return -.5*sum(L1+L2_right+L2_left)
 
     def prior_mu(self, Atmp, x0tmp, T):
+        # equation 8: [mu0, Amu0, A^2mu0, ..., A^(T-1)mu0]
         Ax = [x0tmp.copy()]
         [Ax.append(Atmp.dot(Ax[tt])) for tt in range(T-1)]
         return Ax
 
     def prior_sigma_inv(self, Atmp, Qtmp, Q0tmp, T):
+        # equation 7: a matrix with diagonal blocks and first off-diagonal block structure
+        # format is a list where i and j are the row and column block indices:
+        # [[[], 00, 01], [10,11,12], [21, 22, 23], ...[T(T-1), TT, []]]
+        # THERE IS SOMETHING WRONG WITH NOT COPMUTING BOTH OFF-DIAGONALS SEPARATEDLY
         Qtmpinv = np.linalg.inv(Qtmp)
-        sigma_inv = [[np.linalg.inv(Q0tmp) + Atmp.T.dot(Qtmpinv.dot(Atmp)), []]]
-        [sigma_inv.append([Atmp.T.dot(Qtmpinv).dot(Atmp)+Qtmpinv, -Qtmpinv.dot(Atmp)])
-         for tt in range(1,T-1)]
-        sigma_inv.append([Qtmpinv, -Qtmpinv.dot(Atmp)])
+        sigma_inv = [[[], np.linalg.inv(Q0tmp) + Atmp.T.dot(Qtmpinv.dot(Atmp))]]
+        [sigma_inv.append([-Qtmpinv.dot(Atmp), Atmp.T.dot(Qtmpinv).dot(Atmp)+Qtmpinv, -Atmp.T.dot(Qtmpinv)])
+         for _ in range(1,T-1)]
+        sigma_inv.append([-Qtmpinv.dot(Atmp), Qtmpinv, []])
         return sigma_inv
-
-    def test_log_prior(self, xtmp, Atmp, Qtmp, Q0tmp, x0tmp):
-        # tests that the prior probability of x is less than if it was exactly mu
-        prior0 = self.log_prior(xtmp, Atmp, Qtmp, Q0tmp, x0tmp)
-        xtest = np.zeros(xtmp.shape)*np.nan
-        xtest[0,:] = x0tmp.copy()
-        for tt in range(1,xtest.shape[0]):
-            xtest[tt,:] = Atmp.dot(xtest[tt-1,:])
-        priortest = self.log_prior(xtest, Atmp, Qtmp, Q0tmp, x0tmp)
-        if (priortest<prior0)&(prior0>=0)&(np.abs(priortest)<1e-8):
-            print(bcolors.OKGREEN+'----- TEST PASSED -----')
-        else:
-            print(bcolors.WARNING+'----- TEST FAILED -----')
 
     def log_posterior(self, xtmp, ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
                       X=None, poisson=True):
@@ -248,13 +341,13 @@ class PLDS:
         mu = self.prior_mu(Atmp, x0tmp, xtmp.shape[0])
         sigma_inv = self.prior_sigma_inv(Atmp, Qtmp, Q0tmp, xtmp.shape[0])
         # diagonal
-        Ldiag = [- sigma_inv[tt][0].dot(xtmp[tt, :] - mu[tt]) \
+        Ldiag = [- sigma_inv[tt][1].dot(xtmp[tt, :] - mu[tt]) \
               for tt in range(xtmp.shape[0])]
-
-        # add first off-diagonal
-        Loff1 = [- sigma_inv[tt+1][1].dot(xtmp[tt+1, :] - mu[tt+1]) \
+        # add upper(right)-diagonal
+        Loff1 = [- sigma_inv[tt][2].dot(xtmp[tt+1, :] - mu[tt+1]) \
               for tt in range(xtmp.shape[0] - 1)]
-        Loff2 = [- sigma_inv[tt + 1][1].dot(xtmp[tt, :] - mu[tt]) \
+        # add lower(left)-diagonal
+        Loff2 = [- sigma_inv[tt + 1][0].dot(xtmp[tt, :] - mu[tt]) \
                  for tt in range(xtmp.shape[0] - 1)]
         # add zero array before and after
         Loff1.append(np.zeros(self.xdim))
@@ -264,35 +357,6 @@ class PLDS:
         Loff2 = np.concatenate(Loff2)
         L = [-(Ldiag[tt]+Loff1[tt]+Loff2[tt]) for tt in range(len(Ldiag))]
         return np.array(L)
-
-    def test_J_log_prior(self, xtmp, Atmp, Qtmp, Q0tmp, x0tmp):
-        # tests that the derivative of the prior probability of x is less than if it was exactly mu
-        # and that it is 0 when x=mu
-        prior0 = np.sum(self.J_log_prior(xtmp, Atmp, Qtmp, Q0tmp, x0tmp)**2)
-        xtest = np.zeros(xtmp.shape) * np.nan
-        xtest[0, :] = x0tmp.copy()
-        for tt in range(1, xtest.shape[0]):
-            xtest[tt, :] = Atmp.dot(xtest[tt - 1, :])
-        priortest = np.sum(self.J_log_prior(xtest, Atmp, Qtmp, Q0tmp, x0tmp)**2)
-        if (priortest < prior0) & (prior0 >= 0) & (np.abs(priortest) < 1e-8):
-            print(bcolors.OKGREEN + '----- TEST PASSED -----')
-        else:
-            print(bcolors.WARNING + '----- TEST FAILED -----')
-
-    def test_J_log_lik(self, xtmp, Btmp, Ctmp, Rtmp=None, X=None, poisson=True):
-        # tests that the derivative of the likelihood of y if y is exactly what's expected under x
-        # gives 0 (indicating an extrema)
-        if X is None: X = np.ones([xtmp.shape[0], 1])
-        if poisson:
-            ytest = np.exp(Ctmp.dot(xtmp.T)+Btmp.dot(X.T)).T
-        else:
-            ytest = (Ctmp.dot(xtmp.T)+Btmp.dot(X.T)).T
-        lik0 = self.J_log_lik(xtmp, ytest, Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson)
-        if np.abs(np.sum(lik0**2)) < 1e-8:
-            print(bcolors.OKGREEN + '----- TEST PASSED -----')
-        else:
-            print(bcolors.WARNING + '----- TEST FAILED -----')
-            print(lik0)
 
     def J_log_posterior(self, xtmp, ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
                       X=None, poisson=True):
@@ -324,62 +388,38 @@ class PLDS:
         # OUTPUT: list with xdim by xdim arrays corresponding ot each time point in a trial so that [0] is first time point
         return self.prior_sigma_inv(Atmp, Qtmp, Q0tmp, xtmp.shape[0])
 
-    def test_H_log_prior(self, xtmp, Atmp, Qtmp, Q0tmp):
-        # tests that the Hessian of the prior probability of x is positive-semidefinite
-        # and that it is 0 when x=mu
-        Heig = np.linalg.eigvals(self.block_matrix(self.H_log_prior(xtmp, Atmp, Qtmp, Q0tmp), offdiag=1))
-        if np.mean(Heig>=0)==1:
-            print(bcolors.OKGREEN + '----- TEST PASSED -----')
-        else:
-            print(bcolors.WARNING + '----- TEST FAILED -----')
-
-    def test_H_log_lik(self, xtmp, Btmp, Ctmp, Rtmp=None, X=None, poisson=True):
-        # tests that the Hessian of the likelihood of y|x is positive-semidefinite
-        # and that it is 0 when x=mu
-        Heig = np.linalg.eigvals(self.block_matrix(self.H_log_lik(xtmp, Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson), offdiag=0))
-        if np.mean(Heig>=0)==1:
-            print(bcolors.OKGREEN + '----- TEST PASSED -----')
-        else:
-            print(bcolors.WARNING + '----- TEST FAILED -----')
-
     def H_log_posterior(self, xtmp, ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
                       X=None, poisson=True):
         # computes the Hessian of the negative log-posterior through: log P(x|y) ~ log P(y|x) + log P(x)
         # Xtmp is current estimation of x
-        # expect Xtmp and Ytmp to be time x dimension x trial
-        # one trial
+        # expect Xtmp and Ytmp to be time x dimension (one trial!)
+        # returns Hessian in block matrix format ready to be used with linalg.solveh_banded(self.scipy_block())
         H = self.block_matrix(self.H_log_lik(xtmp, Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson), offdiag=0) + \
             self.block_matrix(self.H_log_prior(xtmp, Atmp, Qtmp, Q0tmp), offdiag=1)
         if np.sum(np.isnan(H))>0:
             H = np.ones(H.shape)*99999999999
-        '''
-        tt = 0
-        H = self.block_matrix(self.H_log_lik(Xtmp[:, :, tt], Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson), offdiag=0)+\
-            self.block_matrix(self.H_log_prior(Xtmp[:, :, tt], Atmp, Qtmp, Q0tmp), offdiag=1)
-        # all other trials
-        for tt in range(1, Xtmp.shape[2]):
-            H += self.block_matrix(self.H_log_lik(Xtmp[:, :, tt], Btmp, Ctmp, Rtmp=Rtmp, X=X, poisson=poisson), offdiag=0)+\
-                    self.block_matrix(self.H_log_prior(Xtmp[:, :, tt], Atmp, Qtmp, Q0tmp), offdiag=1)'''
         return H
 
     def block_matrix(self, L, offdiag=0):
-        # expect that every entry L[0][0], L[1][0], L[2][0] giving the diagonals, have same dimensions!
-        if L[0][0].shape!=L[1][0].shape:
-            return 'error: expect that every entry L[0][0], L[1][0], L[2][0] giving the diagonals, have same dimensions!'
-        mdim = L[0][0].shape
+        # input: takes a matrix of form prior_sigma_inv
+        # output: return reorderd matrix to be used by linalg.solveh_banded(self.scipy_block())
+        # expect that every entry L[0][1], L[1][1], L[2][1] giving the diagonals, have same dimensions!
+        if L[0][1].shape!=L[1][1].shape:
+            return 'error: expect that every entry L[0][1], L[1][1], L[2][1] giving the diagonals, have same dimensions!'
+        mdim = L[0][1].shape
         OUT = np.zeros([mdim[0]*len(L), mdim[1]*len(L)])
         # start with diagonal
         # one matrix after another
         for tt in range(len(L)):
-            OUT[tt*mdim[0]:(tt+1)*mdim[0], tt*mdim[1]:(tt+1)*mdim[1]] =L[tt][0]
+            OUT[tt*mdim[0]:(tt+1)*mdim[0], tt*mdim[1]:(tt+1)*mdim[1]] =L[tt][1]
         # potential offdiagonals
         if offdiag>0:
             for oo in range(1, offdiag+1):
                 for tt in range(len(L)-oo):
                     # upper diagonal
-                    OUT[tt * mdim[0]:(tt + 1) * mdim[0], (tt+oo) * mdim[1]:(tt + oo + 1) * mdim[1]] = L[tt+1][1]
+                    OUT[tt * mdim[0]:(tt + 1) * mdim[0], (tt+oo) * mdim[1]:(tt + oo + 1) * mdim[1]] = L[tt+1][2]
                     # lower diagonal
-                    OUT[(tt + oo) * mdim[0]:(tt + oo + 1) * mdim[0], tt * mdim[1]:(tt + 1) * mdim[1]] = L[tt+1][1]
+                    OUT[(tt + oo) * mdim[0]:(tt + oo + 1) * mdim[0], tt * mdim[1]:(tt + 1) * mdim[1]] = L[tt+1][0]
         return OUT
 
     def block_matrix_list(self, M, mdim, offdiag=0):
@@ -393,14 +433,6 @@ class PLDS:
             [[L[tt+1].append(M[tt * mdim[0]:(tt + 1) * mdim[0], (tt+oo) * mdim[1]:(tt + oo + 1) * mdim[1]])
              for tt in range(int(M.shape[0]/mdim[0])-oo)] for oo in range(1, 1+offdiag)]
         return L
-
-    def test_block(self, M, mdim, offdiag=0):
-        # input is matrix
-        if np.mean(self.block_matrix(self.block_matrix_list(M, mdim, offdiag),offdiag)==M)==1:
-            print(bcolors.OKGREEN + '----- TEST PASSED -----')
-        else:
-            print(bcolors.WARNING + '----- TEST FAILED -----')
-
 
     # wrapper:
     def wrap_x_posterior(self, xtmp0, ytmp, Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp, Rtmp=None,
@@ -524,6 +556,7 @@ class PLDS:
             sigma = []
             for ttrial in range(Ytmp.shape[2]):
                 try:
+                    # !!!! WHY USING np.linalg.inv HERE DIRECTLY???
                     sigma.append(self.block_matrix_list(np.linalg.inv(
                         self.H_log_posterior(mu[:, :, ttrial], Ytmp[:, :, ttrial], Btmp, Ctmp, Atmp, Qtmp, Q0tmp, x0tmp,
                                              Rtmp=Rtmp,
@@ -1021,27 +1054,38 @@ class EM:
         return pred, mse, mu
 
 
-def print_par(MOD, obs=False):
-    print('---- latent var parameters ------')
-    print('A: ', np.linalg.eigvals(MOD.A))
-    print('Q: ', np.linalg.eigvals(MOD.Q))
-    print('---- prior parameters -----------')
-    print('x0: ', MOD.x0)
-    print('Q0: ', np.linalg.eigvals(MOD.Q0))
-    if obs:
-        print('---- observed var parameters ----')
-        print('C: ', MOD.C)
-        print('B: ', MOD.B)
-    print(' ')
 
-class bcolors:
-    HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKCYAN = '\033[96m'
-    OKGREEN = '\033[92m'
-    WARNING = '\033[91m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
+
+#######################################################################
+########################## tests ######################################
+#######################################################################
+
+class eng_tests():
+    def __init__(self, data, MOD):
+        if (len(data.shape) == 2):
+            data = roll(data, MOD.n_step)
+            print('WARNING')
+        n_step, ydim, Ttrials = data.shape
+        if (n_step!=MOD.n_step)|(ydim!=MOD.ydim)|(Ttrials!=MOD.Ttrials):
+            print('ERROR')
+
+
+
+
+class sci_tests():
+    def __init__(self, data, MOD, n_step=None):
+        if (len(data.shape)==2)&(n_step is None):
+            print("ERROR")
+        else:
+            if (len(data.shape) == 2):
+                data = roll(data, n_step)
+                print('WARNING')
+        self.T, self.ydim, self.Ttrials = data.shape
+
+    def data_distribution(self, data, MOD):
+        if MOD.poisson==True:
+            # ff needs to be >=1, should not be lower than .5
+            ff = np.var(data, axis=(0,2))/np.mean(data, axis=(0,2))
+            if any(ff<.5):
+                print('WARNING')
 
